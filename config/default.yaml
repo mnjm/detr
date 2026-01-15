@@ -1,0 +1,61 @@
+defaults:
+  - model: detr-t
+  - _self_
+
+rng_seed: 31415
+
+interactive: true
+
+dataset_name: voc_2007_2012
+n_class: 21 # 20 voc classes + 1 for background
+
+n_epochs: 300
+grad_accum_steps: 4
+init_from: scratch
+device_type: cuda
+torch_compile: true
+enable_tf32: true
+clip_grad_norm_1: true
+autocast_dtype: bf16
+save_every_epoch: 20
+val_every_epoch: 10
+
+dataloader:
+  batch_size: 32
+  num_workers: 4
+  pin_memory: true
+  drop_last: true
+
+augmentations:
+  - _target_: torchvision.transforms.v2.RandomHorizontalFlip
+  - _target_: torchvision.transforms.v2.RandomZoomOut
+    fill: [123.5, 116.0, 103.5]
+    side_range: [1.0, 2.0]
+  - _target_: torchvision.transforms.v2.RandomIoUCrop
+  - _target_: torchvision.transforms.v2.RandomPhotometricDistort
+
+input_size: 640
+input_normalization:
+  mean: [0.485, 0.456, 0.406]
+  std: [0.229, 0.224, 0.225]
+
+optimizer:
+  type: adamw
+  lr: 1e-4
+  betas: [0.9, 0.99]
+  weight_decay: 0.01
+  eps: 1e-8
+  fused: true
+
+logging:
+  log_dir: ./logs
+  wandb:
+    enable: false
+    project: detr
+
+hydra:
+  job:
+    name: ${model.name}-${now_ist:%d-%m-%y-%H%M%S}
+  run:
+    dir: ${logging.log_dir}/${hydra.job.name}
+  output_subdir: config

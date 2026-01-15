@@ -1,0 +1,20 @@
+name: detr-t
+backbone: resnet18
+freeze_backbone: false
+n_queries: 24
+background_cls_idx: 0
+hidden_dim: 256
+ffn_intermediate_dim: 2048 # hidden_dim * 8
+n_encoders: 6
+n_encoder_heads: 8
+n_decoders: 6
+n_decoder_heads: 8
+n_class: ${n_class}
+attn_drop_rate: .1
+ffn_drop_rate: .1
+
+cls_matching_weight: 1.
+l1_matching_weight: 5.
+giou_matching_weight: 2.
+
+background_cls_weight: .1
