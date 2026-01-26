@@ -282,8 +282,9 @@ class DETR(nn.Module):
         }
 
         if targets is not None:
-            loss = self._loss_fn(cls_logits, bboxs_output, targets)
+            loss, matched_indices = self._loss_fn(cls_logits, bboxs_output, targets)
             ret['loss'] = loss
+            ret['matched_indices'] = matched_indices
 
         return ret
 
@@ -420,8 +421,8 @@ class DETR(nn.Module):
             'loss': loss,
             'loss_cls': loss_cls_avg,
             'loss_l1': loss_l1_avg,
-            'loss_giou': loss_giou_avg
-        }
+            'loss_giou': loss_giou_avg,
+        }, match_indices # returning last layer's matched indices for metrics
 
     def configure_optimizer(self, optim_cfg: object, device: torch.device):
         supported_optimizers_map = { 'adamw': torch.optim.AdamW }

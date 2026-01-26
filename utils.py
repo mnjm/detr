@@ -8,6 +8,7 @@ from functools import wraps
 from time import time
 import pytz
 import torch
+from torchvision.ops import box_iou
 import wandb
 from dotenv import load_dotenv
 
@@ -77,6 +78,71 @@ def timer(func):
         t = time() - t0
         return t, ret
     return wrapper
+
+class DeTRMetrics:
+    """
+    Simple DETR metrics
+    """
+
+    def __init__(self, background_idx: int):
+        self.bg_idx = background_idx
+        self.reset()
+
+    def reset(self):
+        self.cls_correct = 0
+        self.cls_total = 0
+        self.iou_sum = 0.0
+        self.iou_count = 0
+        self.matched = 0
+        self.total_gt = 0
+        self.bg_preds = 0
+        self.total_preds = 0
+
+    @torch.no_grad()
+    def update(self, cls_probs, bboxes, targets, match_indices):
+        """
+        Args:
+            cls_probs: (B, Q, C) - class probabilities (post-softmax)
+            bboxes: (B, Q, 4)
+            targets: list of dicts
+            match_indices: Hungarian output
+        """
+        B, Q, _ = cls_probs.shape
+
+        preds_cls = cls_probs.argmax(dim=-1)
+
+        self.bg_preds += (preds_cls == self.bg_idx).sum().item()
+        self.total_preds += B * Q
+
+        for i, (pred_idx, tgt_idx) in enumerate(match_indices):
+            num_gt = targets[i]["labels"].numel()
+            self.total_gt += num_gt
+
+            if tgt_idx.numel() == 0:
+                continue
+
+            self.matched += tgt_idx.numel()
+
+            pred_labels = preds_cls[i, pred_idx]
+            tgt_labels = targets[i]["labels"][tgt_idx]
+
+            self.cls_correct += (pred_labels == tgt_labels).sum().item()
+            self.cls_total += tgt_labels.numel()
+
+            pred_boxes = bboxes[i, pred_idx]
+            tgt_boxes = targets[i]["bboxes"][tgt_idx]
+            ious = box_iou(pred_boxes, tgt_boxes).diag()
+
+            self.iou_sum += ious.sum().item()
+            self.iou_count += ious.numel()
+
+    def compute(self):
+        return {
+            "cls_acc_matched": (self.cls_correct / self.cls_total if self.cls_total > 0 else 0.0),
+            "mean_iou": (self.iou_sum / self.iou_count if self.iou_count > 0 else 0.0),
+            "match_ratio": (self.matched / self.total_gt if self.total_gt > 0 else 0.0),
+            "bg_ratio": (self.bg_preds / self.total_preds if self.total_preds > 0 else 0.0),
+        }
 
 class WandBLogger:
 
