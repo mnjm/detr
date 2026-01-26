@@ -282,8 +282,9 @@ class DETR(nn.Module):
         }
 
         if targets is not None:
-            loss = self._loss_fn(cls_logits, bboxs_output, targets)
+            loss, matched_indices = self._loss_fn(cls_logits, bboxs_output, targets)
             ret['loss'] = loss
+            ret['matched_indices'] = matched_indices
 
         return ret
 
@@ -301,34 +302,40 @@ class DETR(nn.Module):
         Returns:
             list of tuples (pred_idx, target_idx) for each image in batch
         """
-        B, n_queries, _ = cls_logits.shape
+        B, Q, C = cls_logits.shape
+        device = cls_logits.device
         cfg = self.cfg
 
-        out_prob = cls_logits.softmax(dim=-1)  # (B*n_queries, n_cls)
+        cls_prob = cls_logits.softmax(-1) # (B, Q, C)
+        cls_prob = cls_prob.reshape(-1, C) # (B*Q, C)
+        pred_boxes = bboxes.reshape(-1, 4) # (B*Q, 4)
+
+        tgt_labels = torch.cat([t["labels"] for t in targets], dim=0) # (n_tgts_for_entire_batch,)
+        tgt_boxes = torch.cat([t["bboxes"] for t in targets], dim=0) # (n_tgts_for_entire_batch,4)
+
+        cost_class = -cls_prob[:, tgt_labels] # (B*Q, n_tgts_for_entire_batch)
+        cost_l1 = torch.cdist(pred_boxes, tgt_boxes, p=1) # (B*Q, n_tgts_for_entire_batch)
+        cost_giou = -generalized_box_iou(pred_boxes, tgt_boxes) # (B*Q, n_tgts_for_entire_batch)
+
+        total_cost = (
+            cfg.cls_matching_weight * cost_class +
+            cfg.l1_matching_weight * cost_l1 +
+            cfg.giou_matching_weight * cost_giou
+        )
+
+        total_cost = total_cost.view(B, Q, -1).cpu()
+
+        tgt_sizes = [len(t["labels"]) for t in targets]
+        cost_splits = total_cost.split(tgt_sizes, dim=-1)
 
         match_indices = []
-        for i in range(B):
-            # Slice predictions for this image
-            out_prob_i = out_prob[i]
-            out_bbox_i = bboxes[i]
 
-            tgt_lbls_i = targets[i]["labels"]
-            tgt_bbox_i = targets[i]["bboxes"]
-
-            cost_class = -out_prob_i[:, tgt_lbls_i]
-            cost_bbox = torch.cdist(out_bbox_i, tgt_bbox_i, p=1)
-            cost_giou = -generalized_box_iou(out_bbox_i, tgt_bbox_i)
-
-            C = (cfg.cls_matching_weight * cost_class +
-                cfg.l1_matching_weight * cost_bbox +
-                cfg.giou_matching_weight * cost_giou)
-
-            C = C.cpu()
-            pred_idx, target_idx = linear_sum_assignment(C.numpy())
-
+        for b in range(B):
+            C_b = cost_splits[b][b]
+            pred_idx, tgt_idx = linear_sum_assignment(C_b)
             match_indices.append((
-                torch.as_tensor(pred_idx, dtype=torch.int64, device=cls_logits.device),
-                torch.as_tensor(target_idx, dtype=torch.int64, device=cls_logits.device)
+                torch.as_tensor(pred_idx, device=device),
+                torch.as_tensor(tgt_idx, device=device)
             ))
 
         return match_indices
@@ -420,8 +427,8 @@ class DETR(nn.Module):
             'loss': loss,
             'loss_cls': loss_cls_avg,
             'loss_l1': loss_l1_avg,
-            'loss_giou': loss_giou_avg
-        }
+            'loss_giou': loss_giou_avg,
+        }, match_indices # returning last layer's matched indices for metrics
 
     def configure_optimizer(self, optim_cfg: object, device: torch.device):
         supported_optimizers_map = { 'adamw': torch.optim.AdamW }

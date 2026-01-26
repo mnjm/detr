@@ -13,7 +13,7 @@ n_epochs: 300
 grad_accum_steps: 4
 init_from: scratch
 device_type: cuda
-torch_compile: true
+torch_compile: false
 enable_tf32: true
 clip_grad_norm_1: true
 autocast_dtype: bf16

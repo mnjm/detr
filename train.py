@@ -24,8 +24,9 @@ from utils import (
     torch_set_seed,
     get_ist_time_now,
     timer,
-    AverageMetric,
+    AverageMetrics,
     WandBLogger,
+    DeTRMetrics
 )
 OmegaConf.register_new_resolver("now_ist", get_ist_time_now)
 
@@ -91,7 +92,7 @@ def main(cfg):
         run=run_name,
         config=OmegaConf.to_container(cfg, resolve=True, throw_on_missing=True),
         tags=("train", "val"),
-        metrics=("loss", "loss_cls", "loss_l1", "loss_giou", "time"),
+        metrics=("loss", "loss_cls", "loss_l1", "loss_giou", "time", "cls_acc_matched", "mean_iou", "bg_ratio"),
         run_id=wandb_id,
         enable=cfg.logging.wandb.enable
     )
@@ -102,7 +103,8 @@ def main(cfg):
     @timer
     def train_epoch():
         model.train()
-        loss, loss_cls, loss_l1, loss_giou = AverageMetric(), AverageMetric(), AverageMetric(), AverageMetric()
+        loss_metrics = AverageMetrics()
+        detr_metrics = DeTRMetrics(model_cfg.background_cls_idx)
         progress_bar = tqdm(train_dataloader, dynamic_ncols=True, desc="Train", leave=False, disable=(not cfg.interactive))
         for step, batch in enumerate(progress_bar):
             imgs, tgts = batch[0], batch[1]
@@ -113,10 +115,10 @@ def main(cfg):
 
             with autocast_ctx:
                 ret = model(imgs, tgts)
+            pred_cls_probs = ret['class_probs']
+            pred_bboxes = ret['bboxes']
+            match_indices = ret['matched_indices']
             loss_i = ret['loss']['loss']
-            loss_cls_i = ret['loss']['loss_cls']
-            loss_l1_i = ret['loss']['loss_l1']
-            loss_giou_i = ret['loss']['loss_giou']
 
             (loss_i / grad_accum_steps).backward()
             if (step+1) % grad_accum_steps == 0:
@@ -126,16 +128,9 @@ def main(cfg):
                 optimizer.zero_grad(set_to_none=True)
 
             batch_size = imgs.size(0)
-            loss.update(loss_i.item(), batch_size)
-            loss_cls.update(loss_cls_i.item(), batch_size)
-            loss_l1.update(loss_l1_i.item(), batch_size)
-            loss_giou.update(loss_giou_i.item(), batch_size)
-            progress_bar.set_postfix({
-                'loss': f"{loss_i.item():.4f}",
-                'loss_cls': f"{loss_cls_i.item():.4f}",
-                'loss_l1': f"{loss_l1_i.item():.4f}",
-                'loss_giou': f"{loss_giou_i.item():.4f}",
-            })
+            loss_metrics.update({ k:v.item() for k, v in ret['loss'].items() }, batch_size)
+            detr_metrics.update(pred_cls_probs, pred_bboxes, tgts, match_indices)
+            progress_bar.set_postfix({ k:f"{v.item():.4f}" for k, v in ret['loss'].items() })
 
         if (step+1) % grad_accum_steps != 0:
             if cfg.clip_grad_norm_1:
@@ -146,13 +141,14 @@ def main(cfg):
         progress_bar.close()
         if device.type == "cuda":
             torch.cuda.synchronize()
-        return loss.avg, loss_cls.avg, loss_l1.avg, loss_giou.avg
+        return loss_metrics.compute() | detr_metrics.compute()
 
     @timer
     @torch.no_grad()
     def val_epoch():
         model.eval()
-        loss, loss_cls, loss_l1, loss_giou = AverageMetric(), AverageMetric(), AverageMetric(), AverageMetric()
+        loss_metrics = AverageMetrics()
+        detr_metrics = DeTRMetrics(model_cfg.background_cls_idx)
         progress_bar = tqdm(val_dataloader, dynamic_ncols=True, desc="Val", leave=False, disable=(not cfg.interactive))
         for step, batch in enumerate(progress_bar):
             imgs, tgts = batch[0], batch[1]
@@ -163,50 +159,39 @@ def main(cfg):
 
             with autocast_ctx:
                 ret = model(imgs, tgts)
-            loss_i = ret['loss']['loss']
-            loss_cls_i = ret['loss']['loss_cls']
-            loss_l1_i = ret['loss']['loss_l1']
-            loss_giou_i = ret['loss']['loss_giou']
+            pred_cls_probs = ret['class_probs']
+            pred_bboxes = ret['bboxes']
+            match_indices = ret['matched_indices']
 
             batch_size = imgs.size(0)
-            loss.update(loss_i.item(), batch_size)
-            loss_cls.update(loss_cls_i.item(), batch_size)
-            loss_l1.update(loss_l1_i.item(), batch_size)
-            loss_giou.update(loss_giou_i.item(), batch_size)
-            progress_bar.set_postfix({
-                'loss': f"{loss_i.item():.4f}",
-                'loss_cls': f"{loss_cls_i.item():.4f}",
-                'loss_l1': f"{loss_l1_i.item():.4f}",
-                'loss_giou': f"{loss_giou_i.item():.4f}",
-            })
+            loss_metrics.update({ k:v.item() for k, v in ret['loss'].items() }, batch_size)
+            detr_metrics.update(pred_cls_probs, pred_bboxes, tgts, match_indices)
+            progress_bar.set_postfix({ k:f"{v.item():.4f}" for k, v in ret['loss'].items() })
 
         progress_bar.close()
         if device.type == "cuda":
             torch.cuda.synchronize()
-        return loss.avg, loss_cls.avg, loss_l1.avg, loss_giou.avg
+        return loss_metrics.compute() | detr_metrics.compute()
 
-    t, (loss, loss_cls, loss_l1, loss_giou) = val_epoch()
-    logger.info(f"Initial Val loss={loss:.4f} loss_cls={loss_cls:.4f} loss_l1={loss_l1:.4f} loss_giou={loss_giou:.4f} Time={t:.2f}s")
-    wb_logger.log("val", {'epoch': start_epoch-1, 'loss': loss, 'loss_cls': loss_cls, 'loss_l1':loss_l1, 'loss_giou':loss_giou, 'time':t})
+    t, stats = val_epoch()
+    logger.info(f"Initial Val " + " ".join(f"{k}={v:.4f}" for k, v in stats.items()) + f" Time={t:.2f}s")
+    wb_logger.log("val", {'epoch': start_epoch-1, **stats, 'time':t})
     for epoch in range(start_epoch, cfg.n_epochs + 1):
         last_epoch = epoch == cfg.n_epochs
         logger.info(f"Epoch: {epoch}/{cfg.n_epochs}")
 
-        # Train
-        t, (loss, loss_cls, loss_l1, loss_giou) = train_epoch()
-        logger.info(f"{'Train':<5} loss={loss:.4f} loss_cls={loss_cls:.4f} loss_l1={loss_l1:.4f} loss_giou={loss_giou:.4f} Time={t:.2f}s")
-        wb_logger.log("train", {'epoch': epoch, 'loss': loss, 'loss_cls': loss_cls, 'loss_l1':loss_l1, 'loss_giou':loss_giou, 'time':t})
+        t, stats = train_epoch()
+        logger.info(f"{'Train':<5} " + " ".join(f"{k}={v:.4f}" for k, v in stats.items()) + f" Time={t:.2f}s")
+        wb_logger.log("train", {'epoch': epoch, **stats, 'time':t})
 
         if lr_scheduler is not None:
             lr_scheduler.step()
 
-        # Val
         if last_epoch or epoch % cfg.val_every_epoch == 0:
-            t, (loss, loss_cls, loss_l1, loss_giou) = val_epoch()
-            logger.info(f"{'Val':<5} loss={loss:.4f} loss_cls={loss_cls:.4f} loss_l1={loss_l1:.4f} loss_giou={loss_giou:.4f} Time={t:.2f}s")
-            wb_logger.log("val", {'epoch': epoch, 'loss': loss, 'loss_cls': loss_cls, 'loss_l1':loss_l1, 'loss_giou':loss_giou, 'time':t})
+            t, stats = val_epoch()
+            logger.info(f"{'Val':<5} " + " ".join(f"{k}={v:.4f}" for k, v in stats.items()) + f" Time={t:.2f}s")
+            wb_logger.log("val", {'epoch': epoch, **stats, 'time':t})
 
-        # Ckpt
         if last_epoch or epoch % cfg.save_every_epoch == 0:
             ckpt_path = log_dir / f"{cfg.model.name}.pt"
             torch.save({

@@ -3,11 +3,13 @@ Utility functions
 """
 
 import os
+from collections import defaultdict
 from datetime import datetime
 from functools import wraps
 from time import time
 import pytz
 import torch
+from torchvision.ops import box_iou
 import wandb
 from dotenv import load_dotenv
 
@@ -52,23 +54,6 @@ def get_ist_time_now(fmt="%d-%m-%Y-%H%M%S"):
     now_ist = datetime.now(tz)
     return now_ist.strftime(fmt)
 
-class AverageMetric:
-
-    def __init__(self):
-        self.reset()
-
-    def reset(self):
-        self.val = 0
-        self.avg = 0
-        self.sum = 0
-        self.count = 0
-
-    def update(self, val, n=1):
-        self.val = val
-        self.sum += val * n
-        self.count += n
-        self.avg = self.sum / self.count if self.count > 0 else 0
-
 def timer(func):
     @wraps(func)
     def wrapper(*args, **kwargs):
@@ -77,6 +62,80 @@ def timer(func):
         t = time() - t0
         return t, ret
     return wrapper
+
+class AverageMetrics:
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.total = defaultdict(float)
+        self.count = defaultdict(int)
+
+    def update(self, values, n=1):
+        if n <= 0: return
+        for k, v in values.items():
+            self.total[k] += v * n
+            self.count[k] += n
+
+    def compute(self):
+        return {k: self.total[k] / self.count[k] for k in self.count}
+
+class DeTRMetrics:
+    """
+    Simple DETR metrics
+    """
+
+    def __init__(self, background_idx: int):
+        self.bg_idx = background_idx
+        self.reset()
+
+    def reset(self):
+        self.cls_correct = 0
+        self.cls_total = 0
+        self.iou_sum = 0.0
+        self.iou_count = 0
+        self.bg_preds = 0
+        self.total_preds = 0
+
+    @torch.no_grad()
+    def update(self, cls_probs, bboxes, targets, match_indices):
+        """
+        Args:
+            cls_probs: (B, Q, C) - class probabilities (post-softmax)
+            bboxes: (B, Q, 4)
+            targets: list of dicts
+            match_indices: Hungarian output
+        """
+        B, Q, _ = cls_probs.shape
+
+        preds_cls = cls_probs.argmax(dim=-1)
+
+        self.bg_preds += (preds_cls == self.bg_idx).sum().item()
+        self.total_preds += B * Q
+
+        for i, (pred_idx, tgt_idx) in enumerate(match_indices):
+            if tgt_idx.numel() == 0:
+                continue
+
+            pred_labels = preds_cls[i, pred_idx]
+            tgt_labels = targets[i]["labels"][tgt_idx]
+
+            self.cls_correct += (pred_labels == tgt_labels).sum().item()
+            self.cls_total += tgt_labels.numel()
+
+            pred_boxes = bboxes[i, pred_idx]
+            tgt_boxes = targets[i]["bboxes"][tgt_idx]
+            ious = box_iou(pred_boxes, tgt_boxes).diag()
+
+            self.iou_sum += ious.sum().item()
+            self.iou_count += ious.numel()
+
+    def compute(self):
+        return {
+            "cls_acc_matched": (self.cls_correct / self.cls_total if self.cls_total > 0 else 0.0),
+            "mean_iou": (self.iou_sum / self.iou_count if self.iou_count > 0 else 0.0),
+            "bg_ratio": (self.bg_preds / self.total_preds if self.total_preds > 0 else 0.0),
+        }
 
 class WandBLogger:
 
